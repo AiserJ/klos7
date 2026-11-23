@@ -1,6 +1,13 @@
-# KLOS7 — V1
+# KLOS7 — V1.1
 
 Ta garde-robe de tenues, guidée par la météo. Les photos restent sur le téléphone (rien n'est envoyé sur un serveur), sauf la position envoyée à Open-Meteo pour la météo.
+
+## Nouveautés 1.1
+- Correction des photos illisibles (« ? ») sur iPhone : les images sont maintenant stockées en octets bruts. Les anciennes tenues sont converties automatiquement, et une photo irrécupérable affiche « Photo à remplacer ».
+- Les PNG détourés (fond transparent) gardent un fond clair au lieu de devenir noirs.
+- Une nouvelle tenue est enregistrée comme tenue du jour par défaut (interrupteur « Je la porte aujourd'hui »).
+- Météo actualisée toutes les 30 min entre 7h et 22h quand l'app est ouverte, avec une alerte si la prévision change (plus froid, plus doux, pluie).
+- Message précis quand la localisation est bloquée.
 
 ## Ce que fait la V1
 - **Ajouter une tenue** : photo (appareil ou galerie), compressée automatiquement (~3 Mo → ~200 Ko), avec des tags température, pluie, style, occasion et une note.

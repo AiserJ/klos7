@@ -1,5 +1,5 @@
 /* KLOS7 — service worker : app utilisable hors ligne, mises à jour automatiques quand on est en ligne. */
-const CACHE = 'klos7-v1.0.0';
+const CACHE = 'klos7-v1.1.0';
 const SHELL = [
   './',
   './index.html',

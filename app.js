@@ -3,7 +3,7 @@
  */
 'use strict';
 
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 // Lien vers ton formulaire de retours (Google Form, Tally…). Laisse vide pour masquer le bouton.
 const FEEDBACK_URL = '';
 
@@ -91,9 +91,52 @@ function run(storeName, mode, fn) {
     tx.onabort = () => reject(tx.error);
   }));
 }
+/* Les photos sont stockées en octets bruts (ArrayBuffer) et non en Blob :
+ * sur iPhone, les Blob relus depuis IndexedDB dans une web app installée
+ * deviennent parfois illisibles (image cassée « ? »). */
+const blobToRec = async b => (b ? { buf: await b.arrayBuffer(), type: b.type || 'image/jpeg' } : null);
+const recToBlob = r => (r && r.buf ? new Blob([r.buf], { type: r.type || 'image/jpeg' }) : null);
+
+async function toRecord(o) {
+  return {
+    id: o.id, created: o.created, note: o.note || '', worn: o.worn || [], tags: o.tags,
+    img: await blobToRec(o.image), th: await blobToRec(o.thumb),
+  };
+}
+function fromRecord(r) {
+  const image = recToBlob(r.img);
+  return {
+    id: r.id, created: r.created, note: r.note || '', worn: r.worn || [], tags: r.tags,
+    image, thumb: recToBlob(r.th) || image, broken: !image,
+  };
+}
+async function migrateOld(r) {
+  // Ancien format V1 : r.image / r.thumb en Blob
+  const o = { id: r.id, created: r.created, note: r.note || '', worn: r.worn || [], tags: r.tags, image: null, thumb: null };
+  try {
+    o.image = new Blob([await r.image.arrayBuffer()], { type: r.image.type || 'image/jpeg' });
+    o.thumb = r.thumb ? new Blob([await r.thumb.arrayBuffer()], { type: r.thumb.type || 'image/jpeg' }) : o.image;
+  } catch (e) { /* photo perdue : on garde la tenue, l'utilisateur pourra la remplacer */ }
+  o.broken = !o.image;
+  return o;
+}
+
 const Outfits = {
-  all: () => run('outfits', 'readonly', s => s.getAll()),
-  put: o => run('outfits', 'readwrite', s => s.put(o)),
+  async all() {
+    const raw = (await run('outfits', 'readonly', s => s.getAll())) || [];
+    const out = [];
+    for (const r of raw) {
+      if (r.img !== undefined) { out.push(fromRecord(r)); continue; }
+      const o = await migrateOld(r);
+      if (!o.broken) await Outfits.put(o);
+      out.push(o);
+    }
+    return out;
+  },
+  async put(o) {
+    const rec = await toRecord(o); // lecture des octets AVANT d'ouvrir la transaction
+    return run('outfits', 'readwrite', s => s.put(rec));
+  },
   del: id => run('outfits', 'readwrite', s => s.delete(id)),
   clear: () => run('outfits', 'readwrite', s => s.clear()),
 };
@@ -142,6 +185,9 @@ function resizeTo(src, max, quality) {
   c.height = Math.round(h * scale);
   const ctx = c.getContext('2d');
   ctx.imageSmoothingQuality = 'high';
+  // fond clair : un PNG détouré (fond transparent) ne devient pas un rectangle noir en JPEG
+  ctx.fillStyle = '#F4F4F1';
+  ctx.fillRect(0, 0, c.width, c.height);
   ctx.drawImage(src, 0, 0, c.width, c.height);
   return new Promise((resolve, reject) => c.toBlob(b => b ? resolve(b) : reject(new Error('compression impossible')), 'image/jpeg', quality));
 }
@@ -219,33 +265,76 @@ function weatherURL(loc) {
 }
 const locKey = loc => `${loc.lat.toFixed(3)},${loc.lon.toFixed(3)}`;
 
+/* Actualisation : toutes les 30 min entre 7h et 22h tant que l'app est ouverte.
+ * En dehors de cette plage, pas d'appel automatique, sauf si la météo affichée date d'un autre jour. */
+const WX_START = 7, WX_END = 22, WX_EVERY = 30 * 60 * 1000;
+const inWxWindow = (d = new Date()) => d.getHours() >= WX_START && d.getHours() < WX_END;
+const hhmm = t => new Date(t).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+
+function needsRefresh(at) {
+  if (!at) return true;
+  if (ymd(new Date(at)) !== todayStr()) return true; // données d'un autre jour
+  return inWxWindow() && Date.now() - at >= WX_EVERY;
+}
+
 async function loadWeather(force = false) {
-  if (!state.loc) return;
+  if (!state.loc || state.wxBusy) return;
   const key = locKey(state.loc);
   const cached = await KV.get('weather');
   if (cached && cached.key === key) {
     state.weather = cached.data;
     state.weatherAt = cached.at;
-    if (!force && Date.now() - cached.at < 30 * 60 * 1000) { state.weatherStatus = 'ok'; render(); return; }
+    if (!force && !needsRefresh(cached.at)) { state.weatherStatus = 'ok'; render(); return; }
+  } else if (!force) {
+    state.weather = null; state.weatherAt = 0;
   }
-  state.weatherStatus = 'loading';
-  render();
+  const before = state.weather && cached && cached.key === key ? state.weather : null;
+  state.wxBusy = true;
+  if (!state.weather) { state.weatherStatus = 'loading'; render(); }
   try {
     const data = await fetchJSON(weatherURL(state.loc));
     state.weather = data;
     state.weatherAt = Date.now();
     state.weatherStatus = 'ok';
     await KV.set('weather', { key, at: state.weatherAt, data });
+    if (before) detectForecastChanges(before, data);
   } catch (e) {
     state.weatherStatus = state.weather ? 'stale' : 'error';
   }
+  state.wxBusy = false;
   render();
 }
 
+/* Compare l'ancienne et la nouvelle prévision pour aujourd'hui et demain */
+function detectForecastChanges(oldW, newW) {
+  for (const date of [todayStr(), tomorrowStr()]) {
+    const a = dayInfoFrom(oldW, date), b = dayInfoFrom(newW, date);
+    if (!a || !b) continue;
+    const parts = [];
+    const ia = BUCKETS.indexOf(a.bucket), ib = BUCKETS.indexOf(b.bucket);
+    if (ib < ia) parts.push(`plus froid que prévu (${Math.round(b.feels)}° ressentis)`);
+    if (ib > ia) parts.push(`plus doux que prévu (${Math.round(b.feels)}° ressentis)`);
+    if (b.rainy && !a.rainy) parts.push(`pluie désormais annoncée (${Math.round(b.pp)} %)`);
+    if (!b.rainy && a.rainy) parts.push('la pluie n\'est plus annoncée');
+    if (!parts.length) continue;
+
+    const when = date === todayStr() ? 'Aujourd\'hui' : 'Demain';
+    let msg = `${when} : ${parts.join(', ')}.`;
+    const chosen = state.outfits.find(o => (o.worn || []).includes(date));
+    if (chosen && !outfitFits(chosen, b)) msg += ' Ta tenue prévue n\'est peut-être plus adaptée.';
+    state.wxAlerts[date] = { msg, outfitId: chosen ? chosen.id : null };
+    if (state.suggestion && state.suggestion.date === date) state.suggestion = null; // suggestion à refaire
+    toast(`Prévisions mises à jour · ${when.toLowerCase()}`);
+  }
+}
+const outfitFits = (o, d) => (o.tags.temp || []).includes(d.bucket) && (!d.rainy || o.tags.rain);
+
 function dayInfo(offset) {
-  const w = state.weather;
+  return dayInfoFrom(state.weather, offset === 0 ? todayStr() : tomorrowStr(), offset === 0);
+}
+function dayInfoFrom(w, date, withCurrent = false) {
   if (!w || !w.daily) return null;
-  const date = offset === 0 ? todayStr() : tomorrowStr();
+  const offset = withCurrent ? 0 : 1;
   const i = w.daily.time.indexOf(date);
   if (i < 0) return null;
   const D = w.daily;
@@ -333,6 +422,9 @@ const state = {
   filters: { temp: null, style: null, occasion: null },
   cityResults: [],
   draft: null,
+  wxAlerts: {},   // { 'AAAA-MM-JJ': { msg, outfitId } } quand la prévision change
+  wxBusy: false,
+  geoError: '',
 };
 const selectedDate = () => (state.day === 0 ? todayStr() : tomorrowStr());
 
@@ -369,6 +461,7 @@ function locationPromptHTML() {
       <h2 class="h-display" style="font-size:24px">Où es-tu&nbsp;?</h2>
       <p class="muted" style="margin:8px 0 14px">KLOS7 a besoin de ta ville pour la météo. Rien n'est envoyé ailleurs qu'au service météo.</p>
       <button class="btn block" data-act="geo">Me localiser</button>
+      ${geoErrorHTML()}
       <div class="label">ou choisis une ville</div>
       ${citySearchHTML()}
     </div>`;
@@ -385,7 +478,8 @@ function weatherHTML(d) {
   const big = d.current ? Math.round(d.current.temperature_2m) : Math.round(d.tmax);
   const advice = ADVICE[d.bucket] + (d.rainy ? ' <strong>Pluie probable : pense aux pièces qui ne craignent pas l\'eau.</strong>' : '');
   const stale = state.weatherStatus === 'stale'
-    ? `<div class="wx-stale">Hors ligne · météo du ${new Date(state.weatherAt).toLocaleString('fr-FR', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}</div>` : '';
+    ? `<div class="wx-stale">Hors ligne · météo du ${new Date(state.weatherAt).toLocaleString('fr-FR', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}</div>`
+    : state.weatherAt ? `<div class="wx-stale">Mise à jour à ${hhmm(state.weatherAt)} · actualisée toutes les 30 min de ${WX_START}h à ${WX_END}h${state.wxBusy ? ' · actualisation…' : ''}</div>` : '';
   return `
     <div class="wx">
       <div class="wx-top">
@@ -409,11 +503,19 @@ function weatherHTML(d) {
     </div>`;
 }
 
+/* Photo d'une tenue, avec un remplaçant lisible si l'image est perdue ou illisible */
+const PHOTO_MISSING = '<span class="ph-missing"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8a2 2 0 0 1 2-2h2l1.5-2h7L17 6h2a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><circle cx="12" cy="13" r="3.5"/></svg>Photo à remplacer</span>';
+function photoHTML(o, kind, cls = '') {
+  if (o.broken || !o.image) return `<div class="ph-missing-wrap ${cls}">${PHOTO_MISSING}</div>`;
+  return `<img class="${cls}" src="${imgURL(o, kind)}" alt="Tenue" onerror="this.outerHTML=PHOTO_FALLBACK">`;
+}
+window.PHOTO_FALLBACK = `<div class="ph-missing-wrap">${PHOTO_MISSING}</div>`;
+
 function outfitCardHTML(o, { badge, reasons, actions }) {
   return `
     <div class="outfit-card">
       <div class="ph">
-        <img src="${imgURL(o, 'image')}" alt="Tenue">
+        ${photoHTML(o, 'image')}
         ${badge ? `<span class="badge">${esc(badge)}</span>` : ''}
       </div>
       <div class="body">
@@ -442,6 +544,18 @@ function renderToday() {
     html += `<div class="banner">🌙 Ce soir, prépare ta tenue de demain&nbsp;: ${esc(fmtLong(date))}.</div>`;
   }
   html += weatherHTML(d);
+
+  const alert = state.wxAlerts[date];
+  if (alert) {
+    html += `
+      <div class="banner alert">
+        <span>⚠️ ${esc(alert.msg)}</span>
+        <span class="alert-actions">
+          ${alert.outfitId ? `<button class="btn" data-act="change" data-id="${alert.outfitId}">Changer</button>` : `<button class="btn" data-act="inspire">Nouvelle suggestion</button>`}
+          <button class="icon-btn" data-act="dismiss-alert" data-date="${date}" aria-label="Fermer l'alerte">✕</button>
+        </span>
+      </div>`;
+  }
 
   html += `<div class="label">Occasion</div><div class="chips scroll">
     ${chip('Toutes', state.occasion === 'all', 'data-act="occ" data-v="all"')}
@@ -507,7 +621,7 @@ function renderCloset() {
     const today = todayStr();
     html += `<div class="grid">${list.map(o => `
       <button data-act="open" data-id="${o.id}" aria-label="Voir la tenue">
-        <img src="${imgURL(o, 'thumb')}" alt="" loading="lazy">
+        ${photoHTML(o, 'thumb')}
         ${(o.worn || []).includes(today) ? '<span class="worn-dot">Auj.</span>' : ''}
       </button>`).join('')}</div>`;
   }
@@ -525,6 +639,7 @@ async function renderSettings() {
     <div class="card">
       <div class="label" style="margin-top:0">Localisation</div>
       <div class="set-row"><b>${state.loc ? esc(state.loc.name) : 'Non définie'}</b><button class="btn soft" data-act="geo" style="min-height:40px">Me localiser</button></div>
+      ${geoErrorHTML()}
       <div style="margin-top:12px">${citySearchHTML()}</div>
     </div>
 
@@ -600,7 +715,8 @@ function openDetail(id) {
   const past = worn.filter(d => d <= today);
   openSheet(`
     <div class="sheet-head"><h2 class="h-display">Tenue</h2><button class="icon-btn" data-act="close-sheet" aria-label="Fermer">✕</button></div>
-    <img class="detail-img" src="${imgURL(o, 'image')}" alt="Tenue">
+    ${photoHTML(o, 'image', 'detail-img')}
+    ${o.broken ? '<p class="small muted" style="margin:8px 0 0">La photo de cette tenue n\'a pas pu être récupérée. Touche « Modifier » pour la reprendre, tes tags sont conservés.</p>' : ''}
     <div style="margin-top:12px">${tagsHTML(o)}</div>
     ${o.note ? `<div class="note">${esc(o.note)}</div>` : ''}
     <div class="meta muted">
@@ -618,7 +734,7 @@ function openEditor(id) {
   const o = id ? state.outfits.find(x => x.id === id) : null;
   state.draft = o
     ? { ...o, tags: { temp: [...o.tags.temp], style: [...o.tags.style], occasion: [...o.tags.occasion], rain: !!o.tags.rain }, isNew: false }
-    : { id: uid(), created: Date.now(), worn: [], note: '', image: null, thumb: null, tags: { temp: [], style: [], occasion: [], rain: false }, isNew: true };
+    : { id: uid(), created: Date.now(), worn: [], note: '', image: null, thumb: null, tags: { temp: [], style: [], occasion: [], rain: false }, isNew: true, wearToday: true };
   renderEditor();
 }
 function renderEditor() {
@@ -650,6 +766,12 @@ function renderEditor() {
     ${group('occasion')}
     <div class="label">Note (optionnel)</div>
     <textarea class="input" id="edNote" rows="2" maxlength="200" placeholder="Ex. AF1 blanches, cargo noir, veste en jean">${esc(d.note)}</textarea>
+    ${d.isNew ? `
+    <div class="label">Aujourd'hui</div>
+    <button class="switch-row" data-act="ed-today" style="width:100%">
+      <span style="text-align:left"><b>Je la porte aujourd'hui</b><br><span class="small muted">Enregistrée comme tenue du jour (${esc(fmtShort(todayStr()))})</span></span>
+      <span class="switch ${d.wearToday ? 'on' : ''}"></span>
+    </button>` : ''}
     <button class="btn block" style="margin-top:18px" data-act="ed-save" ${d.busy ? 'disabled' : ''}>${d.isNew ? 'Enregistrer la tenue' : 'Enregistrer'}</button>`;
 
   const s = $('#sheet');
@@ -691,8 +813,14 @@ async function saveDraft() {
   const i = state.outfits.findIndex(x => x.id === o.id);
   if (i >= 0) state.outfits[i] = o; else state.outfits.push(o);
   const wasNew = d.isNew;
+  const wearToday = d.isNew && d.wearToday;
+  if (wearToday) {
+    await setWorn(o.id, todayStr(), true);
+    if (state.suggestion && state.suggestion.date === todayStr()) state.suggestion = null;
+    delete state.wxAlerts[todayStr()];
+  }
   closeSheet();
-  toast(wasNew ? 'Tenue ajoutée à ta garde-robe' : 'Tenue mise à jour');
+  toast(wearToday ? 'Ajoutée et enregistrée comme tenue du jour ✓' : wasNew ? 'Tenue ajoutée à ta garde-robe' : 'Tenue mise à jour');
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
   render();
 }
@@ -703,10 +831,13 @@ async function saveDraft() {
 function inspire() {
   const date = selectedDate();
   const d = dayInfo(state.day);
-  let pool = state.outfits.filter(o => !state.skipped.includes(o.id));
+  const usable = state.outfits.filter(o => !o.broken);
+  if (!usable.length) { toast('Ajoute d\'abord une tenue avec sa photo'); return; }
+  delete state.wxAlerts[date];
+  let pool = usable.filter(o => !state.skipped.includes(o.id));
   if (!pool.length) {
     state.skipped = [];
-    pool = state.outfits.slice();
+    pool = usable.slice();
     toast('Tu as fait le tour, on recommence !');
   }
   const [best] = rankOutfits(pool, d, state.occasion, date);
@@ -734,12 +865,32 @@ async function setWorn(id, date, on) {
   await Outfits.put(o);
 }
 
+const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+function geoErrorHTML() {
+  return state.geoError ? `<div class="geo-error">${state.geoError}</div>` : '';
+}
 async function geolocate() {
-  if (!navigator.geolocation) { toast('Localisation non disponible, cherche ta ville'); return; }
+  state.geoError = '';
+  if (!navigator.geolocation) {
+    state.geoError = 'La localisation n\'est pas disponible sur cet appareil. Cherche ta ville ci-dessous.';
+    render(); return;
+  }
   toast('Localisation en cours…');
   navigator.geolocation.getCurrentPosition(async pos => {
+    state.geoError = '';
     await setLocation({ lat: pos.coords.latitude, lon: pos.coords.longitude, name: 'Ma position' });
-  }, () => toast('Localisation refusée : cherche ta ville à la place'), { enableHighAccuracy: false, timeout: 12000, maximumAge: 600000 });
+  }, err => {
+    if (err.code === 1) {
+      state.geoError = isIOS
+        ? '<b>Localisation bloquée.</b> Sur iPhone : Réglages › Confidentialité et sécurité › Service de localisation › active-le, puis <b>Sites web Safari</b> › « Lorsque l\'app est active ». Ou cherche simplement ta ville ci-dessous.'
+        : '<b>Localisation bloquée.</b> Autorise la localisation pour ce site dans les réglages du navigateur (et du système), ou cherche ta ville ci-dessous.';
+    } else if (err.code === 3) {
+      state.geoError = 'La localisation a mis trop de temps à répondre. Réessaie, ou cherche ta ville ci-dessous.';
+    } else {
+      state.geoError = 'Position introuvable pour le moment (GPS ou réseau indisponible). Cherche ta ville ci-dessous.';
+    }
+    render();
+  }, { enableHighAccuracy: false, timeout: 12000, maximumAge: 600000 });
 }
 async function setLocation(loc) {
   state.loc = loc;
@@ -777,7 +928,7 @@ async function exportData() {
   if (!state.outfits.length) { toast('Rien à exporter pour l\'instant'); return; }
   toast('Préparation de la sauvegarde…');
   const outfits = [];
-  for (const o of state.outfits) {
+  for (const o of state.outfits.filter(x => !x.broken)) {
     outfits.push({ ...o, image: await blobToDataURL(o.image), thumb: o.thumb ? await blobToDataURL(o.thumb) : null });
   }
   const json = JSON.stringify({ app: 'klos7', version: APP_VERSION, exportedAt: new Date().toISOString(), loc: state.loc, outfits });
@@ -829,7 +980,7 @@ async function wipe() {
   await Outfits.clear();
   await KV.clear();
   for (const id of state.outfits.map(o => o.id)) dropURLs(id);
-  Object.assign(state, { outfits: [], loc: null, weather: null, suggestion: null, skipped: [], tab: 'today' });
+  Object.assign(state, { outfits: [], loc: null, weather: null, weatherAt: 0, suggestion: null, skipped: [], wxAlerts: {}, geoError: '', tab: 'today' });
   toast('Données effacées');
   render();
 }
@@ -950,6 +1101,15 @@ document.addEventListener('click', async e => {
       state.draft.note = $('#edNote')?.value ?? state.draft.note;
       renderEditor();
       break;
+    case 'ed-today':
+      state.draft.wearToday = !state.draft.wearToday;
+      state.draft.note = $('#edNote')?.value ?? state.draft.note;
+      renderEditor();
+      break;
+    case 'dismiss-alert':
+      delete state.wxAlerts[t.dataset.date];
+      render();
+      break;
     case 'ed-save':
       saveDraft();
       break;
@@ -983,11 +1143,15 @@ $('#importInput').addEventListener('change', e => {
 });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && state.loc) {
-    // au retour dans l'app : météo rafraîchie si elle a plus de 30 min
-    if (Date.now() - state.weatherAt > 30 * 60 * 1000) loadWeather();
+    // au retour dans l'app : rafraîchie si besoin (30 min entre 7h et 22h, ou nouveau jour)
+    if (needsRefresh(state.weatherAt)) loadWeather();
     else render();
   }
 });
+// tant que l'app est ouverte : vérification régulière, appels uniquement entre 7h et 22h
+setInterval(() => {
+  if (document.visibilityState === 'visible' && state.loc && needsRefresh(state.weatherAt)) loadWeather();
+}, 5 * 60 * 1000);
 
 /* =========================================================
    Démarrage

@@ -247,3 +247,14 @@ textarea.input:focus, input.input:focus { border-color: var(--ink); }
 
 .spinner { width: 22px; height: 22px; border: 2.5px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- V1.1 ---------- */
+.ph-missing-wrap { width: 100%; height: 100%; min-height: 100%; aspect-ratio: 3 / 4; display: grid; place-items: center; background: var(--chip); color: var(--muted); border-radius: inherit; }
+.ph-missing { display: grid; justify-items: center; gap: 6px; font-size: 12px; font-weight: 600; text-align: center; padding: 8px; }
+.grid .ph-missing-wrap { aspect-ratio: auto; }
+.outfit-card .ph .ph-missing-wrap { max-height: 62vh; }
+.detail-img.ph-missing-wrap { border-radius: 16px; }
+.banner.alert { border-style: solid; justify-content: space-between; margin: 12px 0 0; background: var(--surface); }
+.alert-actions { display: flex; align-items: center; gap: 4px; flex: none; }
+.alert-actions .btn { min-height: 36px; padding: 0 14px; font-size: 13px; }
+.geo-error { margin-top: 10px; padding: 10px 12px; border-radius: 12px; background: var(--chip); font-size: 13px; line-height: 1.45; }
